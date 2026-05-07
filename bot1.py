@@ -46,6 +46,8 @@ WEE_NAME_TRIGGERS = {
     "wee",
     "wee marquez",
     "marquez",
+    "<@U0B22FZF3UN>",  # direct mention trigger
+    'U0B22FZF3UN'
 }
 
 WEE_ABOUT_PHRASES = {
@@ -77,6 +79,8 @@ WEE_ABOUT_PHRASES = {
     "wee’s memory",
     "wee's response",
     "wee’s response",
+    "<@U0B22FZF3UN>",  # direct mention trigger
+    'U0B22FZF3UN'
 }
 
 WEE_PRONOUN_ABOUT_PHRASES = {
@@ -813,12 +817,13 @@ Latest message:
 {speaker_name}: {cleaned_latest}
 
 Instructions:
-- You are Wee Marquez.
 - Reply to the latest message.
+- Avoid using people's full name.
 - Prefer thread context over channel context.
 - Use channel context only if it is clearly helpful.
 - Do not summarize all context unless asked.
 - Keep the reply short and Slack-like.
+- Have fun.
 """.strip()
 
     debug(f"Prompt built: chars={len(prompt)}")
