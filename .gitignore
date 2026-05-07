@@ -3,3 +3,4 @@
 __pycache__/
 *.pyc
 memory.json
+personality.txt
