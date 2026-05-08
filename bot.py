@@ -6,8 +6,10 @@ import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 from dotenv import load_dotenv
@@ -22,6 +24,20 @@ DEFAULT_MEMORY = {
     "memories": [],
     "active_threads": {},
 }
+
+DEFAULT_ENABLED_TOOLS = (
+    "get_time",
+    "search_memory",
+    "update_memory",
+    "summarize_thread",
+    "get_channel_context",
+    "get_user_profile",
+    "list_recent_threads",
+    "save_thread_summary",
+    "search_channel_history",
+    "set_reminder_note",
+    "react_to_message",
+)
 
 STOPWORDS = {
     "the", "a", "an", "and", "or", "but", "if", "then", "is", "are", "was",
@@ -44,12 +60,16 @@ class AgentConfig:
     slack_bot_token: str
     slack_app_token: str
     ollama_model: str
+    tool_router_model: str
     bot_user_id: str | None
     triggers: tuple[str, ...]
     about_phrases: tuple[str, ...]
     pronoun_about_phrases: tuple[str, ...]
+    explicit_only_channels: tuple[str, ...]
+    enabled_tools: tuple[str, ...]
     debug: bool
-    allow_bot_messages: bool
+    event_log_enabled: bool
+    event_log_path: Path
     active_thread_ttl_seconds: int
     max_active_threads: int
     thread_fetch_limit: int
@@ -63,8 +83,9 @@ class AgentConfig:
     ollama_num_predict: int
     ollama_num_ctx: int
     ollama_temperature: float
-    response_cooldown_seconds: int
     max_auto_replies_per_thread: int
+    ambient_response_chance: float
+    thread_ambient_response_chance: float
     max_memories: int
     low_confidence_memory_ttl_days: int
 
@@ -86,7 +107,36 @@ class SeenEventCache:
 
 
 USER_CACHE: dict[str, str] = {}
+CHANNEL_CACHE: dict[str, str] = {}
+CHANNEL_INFO_UNAVAILABLE = False
 SEEN_EVENTS = SeenEventCache()
+
+
+@dataclass(frozen=True)
+class ResponseDecision:
+    should_respond: bool
+    explicit: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class AddressCues:
+    score: int
+    reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ToolContext:
+    config: AgentConfig
+    client: Any
+    memory: dict[str, Any]
+    channel: str
+    thread_ts: str
+    latest_ts: str
+    latest_message: str
+    speaker_name: str
+    thread_context_lines: list[str]
+    channel_context_lines: list[str]
 
 
 def now() -> int:
@@ -123,6 +173,17 @@ def get_agent_env(agent_name: str, key: str, default: str | None = None) -> str 
     if agent_value is not None:
         return agent_value
     return os.getenv(key, default)
+
+
+def default_event_log_path(agent_name: str) -> Path:
+    shared = os.getenv("EVENT_LOG_PATH")
+    agent_specific = os.getenv(f"{agent_env_prefix(agent_name)}_EVENT_LOG_PATH")
+    if agent_specific:
+        return Path(agent_specific)
+    if shared:
+        path = Path(shared)
+        return path.with_name(f"{agent_name}.{path.name}")
+    return Path(f"logs/{agent_name}.events.jsonl")
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -189,6 +250,9 @@ def load_agent_config(agent_name: str) -> AgentConfig:
     if not personality_path.exists():
         raise RuntimeError(f"Missing personality file: {personality_path}")
 
+    ollama_model = raw.get("ollama_model") or get_agent_env(agent_name, "OLLAMA_MODEL", "llama3.1:8b")
+    tool_router_model = raw.get("tool_router_model") or get_agent_env(agent_name, "TOOL_ROUTER_MODEL", ollama_model)
+
     return AgentConfig(
         name=agent_name,
         display_name=display_name,
@@ -197,13 +261,17 @@ def load_agent_config(agent_name: str) -> AgentConfig:
         personality_path=personality_path,
         slack_bot_token=slack_bot_token,
         slack_app_token=slack_app_token,
-        ollama_model=raw.get("ollama_model") or get_agent_env(agent_name, "OLLAMA_MODEL", "llama3.1:8b"),
+        ollama_model=ollama_model,
+        tool_router_model=tool_router_model,
         bot_user_id=bot_user_id,
         triggers=tuple({normalize_phrase(t) for t in triggers if str(t).strip()}),
         about_phrases=tuple({normalize_phrase(t) for t in about_phrases if str(t).strip()}),
         pronoun_about_phrases=tuple(raw.get("pronoun_about_phrases", ["he", "him", "his", "they", "them"])),
+        explicit_only_channels=tuple({normalize_channel_ref(c) for c in raw.get("explicit_only_channels", []) if str(c).strip()}),
+        enabled_tools=tuple(raw.get("enabled_tools", DEFAULT_ENABLED_TOOLS)),
         debug=env_bool("DEBUG", True),
-        allow_bot_messages=env_bool("ALLOW_BOT_MESSAGES", False),
+        event_log_enabled=env_bool("EVENT_LOG_ENABLED", False),
+        event_log_path=default_event_log_path(agent_name),
         active_thread_ttl_seconds=env_int("ACTIVE_THREAD_TTL_SECONDS", 60 * 60 * 12),
         max_active_threads=env_int("MAX_ACTIVE_THREADS", 100),
         thread_fetch_limit=env_int("THREAD_FETCH_LIMIT", 40),
@@ -217,8 +285,9 @@ def load_agent_config(agent_name: str) -> AgentConfig:
         ollama_num_predict=env_int("OLLAMA_NUM_PREDICT", 120),
         ollama_num_ctx=env_int("OLLAMA_NUM_CTX", 4096),
         ollama_temperature=env_float("OLLAMA_TEMPERATURE", 0.7),
-        response_cooldown_seconds=env_int("RESPONSE_COOLDOWN_SECONDS", 20),
         max_auto_replies_per_thread=env_int("MAX_AUTO_REPLIES_PER_THREAD", 6),
+        ambient_response_chance=env_float("AMBIENT_RESPONSE_CHANCE", 0.15),
+        thread_ambient_response_chance=env_float("THREAD_AMBIENT_RESPONSE_CHANCE", 0.35),
         max_memories=env_int("MAX_MEMORIES", 200),
         low_confidence_memory_ttl_days=env_int("LOW_CONFIDENCE_MEMORY_TTL_DAYS", 30),
     )
@@ -243,8 +312,49 @@ def debug_event(config: AgentConfig, prefix: str, event: dict[str, Any]) -> None
     )
 
 
+def event_log(config: AgentConfig, event_type: str, **fields: Any) -> None:
+    if not config.event_log_enabled:
+        return
+    record = {
+        "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "agent": config.name,
+        "event_type": event_type,
+        **fields,
+    }
+    try:
+        config.event_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with config.event_log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except Exception as e:
+        debug(config, f"Could not write event log: {e}")
+
+
+def event_log_message(config: AgentConfig, label: str, event: dict[str, Any]) -> None:
+    event_log(
+        config,
+        label,
+        slack_type=event.get("type"),
+        subtype=event.get("subtype"),
+        user=event.get("user"),
+        bot_id=event.get("bot_id"),
+        app_id=event.get("app_id"),
+        channel=event.get("channel"),
+        ts=event.get("ts"),
+        event_ts=event.get("event_ts"),
+        thread_ts=event.get("thread_ts"),
+        text=event.get("text", ""),
+    )
+
+
 def normalize_phrase(text: str) -> str:
     return clean_slack_text(str(text)).lower().replace("’", "'").strip()
+
+
+def normalize_channel_ref(channel: str) -> str:
+    cleaned = str(channel).strip().lower()
+    if cleaned.startswith("#"):
+        cleaned = cleaned[1:]
+    return cleaned
 
 
 def clean_slack_text(text: str) -> str:
@@ -269,6 +379,90 @@ def text_mentions_agent(config: AgentConfig, text: str) -> bool:
     return any(phrase_in_text(trigger, text) for trigger in config.triggers)
 
 
+def agent_trigger_pattern(config: AgentConfig) -> str:
+    triggers = [
+        normalize_phrase(t)
+        for t in config.triggers
+        if t and not t.startswith("@") and not re.fullmatch(r"u[a-z0-9]+", normalize_phrase(t))
+    ]
+    triggers = sorted(set(triggers), key=len, reverse=True)
+    return "|".join(re.escape(t) for t in triggers)
+
+
+def agent_address_cues(config: AgentConfig, text: str) -> AddressCues:
+    cleaned = normalize_phrase(text)
+    reasons = []
+    score = 0
+
+    if any(t.startswith("@") and phrase_in_text(t, text) for t in config.triggers):
+        return AddressCues(5, ("mention",))
+
+    trigger_pattern = agent_trigger_pattern(config)
+    if not trigger_pattern:
+        return AddressCues(0, ())
+
+    address_words = (
+        "what|why|how|when|where|who|can|could|would|should|do|does|did|"
+        "are|is|tell|say|reply|respond|remember|forget|show|give|help|please"
+    )
+    greeting = r"hey|hi|hello|yo|sup|ok|okay|alright|gm|gn"
+    question_words = r"what|why|how|when|where|who|can|could|would|should|do|does|did|are|is"
+
+    if re.fullmatch(rf"({greeting})?\s*({trigger_pattern})\s*[!.?]*", cleaned):
+        score += 4
+        reasons.append("name_ping")
+    elif re.search(rf"^({greeting})\s+({trigger_pattern})\b", cleaned):
+        score += 4
+        reasons.append("greeting")
+    elif re.search(rf"^({trigger_pattern})\b\s*[,:\-]", cleaned):
+        score += 3
+        reasons.append("address_prefix")
+    elif re.search(rf"^({trigger_pattern})\b", cleaned):
+        score += 2
+        reasons.append("starts_with_name")
+
+    if re.search(rf"\b({trigger_pattern})\b\s+({address_words})\b", cleaned):
+        score += 2
+        reasons.append("name_then_request")
+    if re.search(rf"\b({question_words})\b.*\b({trigger_pattern})\b", cleaned):
+        score += 2
+        reasons.append("question_about_agent")
+    if "?" in cleaned and re.search(rf"\b({trigger_pattern})\b", cleaned):
+        score += 1
+        reasons.append("question_mark_with_name")
+
+    passive_verbs = r"asked|told|mentioned|saw|heard|met|called|dm'd|messaged|pinged"
+    passive_preps = r"about|from|with|for|to"
+    if re.search(rf"\b({passive_verbs}|{passive_preps})\b\s+({trigger_pattern})\b", cleaned):
+        score -= 3
+        reasons.append("passive_reference")
+    if re.search(rf"\b({trigger_pattern})\b\s+(said|told|asked|mentioned|was|is|has|had)\b", cleaned):
+        score -= 2
+        reasons.append("third_person_reference")
+
+    return AddressCues(score, tuple(reasons))
+
+
+def text_directly_addresses_agent(config: AgentConfig, text: str) -> bool:
+    return agent_address_cues(config, text).score >= 2
+
+
+def text_asks_agent_question(config: AgentConfig, text: str) -> bool:
+    cues = agent_address_cues(config, text)
+    return (
+        "question_about_agent" in cues.reasons
+        or ("question_mark_with_name" in cues.reasons and cues.score >= 1)
+    )
+
+
+def text_is_passive_agent_mention(config: AgentConfig, text: str) -> bool:
+    if text_is_social_ack(text):
+        return False
+    return text_mentions_agent(config, text) and not (
+        text_directly_addresses_agent(config, text) or text_asks_agent_question(config, text)
+    )
+
+
 def text_is_about_agent(config: AgentConfig, text: str, active_thread: bool) -> bool:
     cleaned = normalize_phrase(text)
     if any(phrase in cleaned for phrase in config.about_phrases):
@@ -276,21 +470,81 @@ def text_is_about_agent(config: AgentConfig, text: str, active_thread: bool) -> 
     return active_thread and any(phrase_in_text(p, cleaned) for p in config.pronoun_about_phrases)
 
 
-def text_asks_agent_question(config: AgentConfig, text: str) -> bool:
-    cleaned = normalize_phrase(text)
-    trigger_pattern = "|".join(re.escape(t) for t in config.triggers if not t.startswith("@"))
-    if trigger_pattern and re.search(rf"\b({trigger_pattern})\b.*\?", cleaned):
-        return True
-    if trigger_pattern and re.search(rf"\b(what|why|how|can|could|would|should|do|does|did|are|is)\b.*\b({trigger_pattern})\b", cleaned):
-        return True
-    return False
-
-
 def text_asks_active_followup(text: str) -> bool:
     cleaned = normalize_phrase(text)
     if re.search(r"\b(what|why|how|can|could|would|should|do|does|did|are|is)\b.*\byou\b", cleaned):
         return True
     return any(p in cleaned for p in ["what do you think", "thoughts?", "wdyt", "right?", "yes?", "no?"])
+
+
+def text_invites_room_response(text: str) -> bool:
+    cleaned = normalize_phrase(text)
+    if len(cleaned) < 12:
+        return False
+    if any(p in cleaned for p in ["what do yall think", "what do you all think", "thoughts?", "wdyt", "any ideas", "anyone know", "does anyone"]):
+        return True
+    if "?" not in cleaned:
+        return False
+    return bool(
+        re.search(r"\b(anyone|anybody|someone|somebody|yall|you all|we|us)\b", cleaned)
+        or re.search(r"\b(should|can|could|would)\s+(we|i|someone|anyone)\b", cleaned)
+    )
+
+
+def text_is_social_ack(text: str) -> bool:
+    cleaned = normalize_phrase(text)
+    return any(
+        phrase in cleaned
+        for phrase in [
+            "thank you",
+            "thanks",
+            "ty",
+            "congrats",
+            "congratulations",
+            "nice",
+            "yay",
+            "hell yeah",
+            "lets go",
+            "lfg",
+            "we shipped",
+            "that worked",
+        ]
+    )
+
+
+def text_is_reaction_worthy(text: str) -> bool:
+    cleaned = normalize_phrase(text)
+    return text_is_social_ack(text) or any(
+        phrase in cleaned
+        for phrase in [
+            "shipped",
+            "huge win",
+            "big win",
+            "it worked",
+            "worked",
+            "lets go",
+            "lfg",
+            "great job",
+            "good job",
+            "nailed it",
+            "amazing",
+            "awesome",
+            "love this",
+            "lol",
+            "lmao",
+            "rip",
+        ]
+    )
+
+
+def deterministic_chance(key: str, chance: float) -> bool:
+    chance = max(0.0, min(1.0, chance))
+    if chance <= 0:
+        return False
+    if chance >= 1:
+        return True
+    digest = hashlib.sha1(normalize_phrase(key).encode("utf-8")).hexdigest()[:8]
+    return int(digest, 16) / 0xFFFFFFFF < chance
 
 
 def tokenize(text: str) -> set[str]:
@@ -506,10 +760,6 @@ def should_ignore_event(config: AgentConfig, event: dict[str, Any]) -> bool:
         debug(config, "Ignoring own bot user event")
         return True
 
-    if (event.get("bot_id") or event.get("app_id")) and not config.allow_bot_messages:
-        debug(config, "Ignoring bot/app message; set ALLOW_BOT_MESSAGES=1 to opt in")
-        return True
-
     event_ts = event.get("event_ts") or event.get("ts")
     if SEEN_EVENTS.add_or_seen(event_ts):
         debug(config, f"Ignoring duplicate event_ts={event_ts}")
@@ -534,6 +784,63 @@ def get_user_name(config: AgentConfig, client, user_id: str | None) -> str:
         return user_id
 
 
+def get_event_speaker_name(config: AgentConfig, client, event: dict[str, Any]) -> str:
+    user_id = event.get("user")
+    if user_id:
+        return get_user_name(config, client, user_id)
+    bot_profile = event.get("bot_profile") or {}
+    return (
+        event.get("username")
+        or bot_profile.get("name")
+        or bot_profile.get("real_name")
+        or event.get("bot_id")
+        or "unknown"
+    )
+
+
+def get_channel_name(config: AgentConfig, client, channel_id: str) -> str | None:
+    global CHANNEL_INFO_UNAVAILABLE
+    if CHANNEL_INFO_UNAVAILABLE:
+        return None
+    if channel_id in CHANNEL_CACHE:
+        return CHANNEL_CACHE[channel_id]
+    try:
+        result = client.conversations_info(channel=channel_id)
+        channel = result.get("channel", {})
+        name = channel.get("name") or channel.get("name_normalized")
+        if name:
+            CHANNEL_CACHE[channel_id] = normalize_channel_ref(name)
+            return CHANNEL_CACHE[channel_id]
+    except Exception as e:
+        if "missing_scope" in str(e):
+            CHANNEL_INFO_UNAVAILABLE = True
+        debug(config, f"Could not fetch channel info for {channel_id}: {e}")
+    return None
+
+
+def channel_is_explicit_only(config: AgentConfig, client, channel_id: str) -> bool:
+    if not config.explicit_only_channels:
+        return False
+    configured = set(config.explicit_only_channels)
+    normalized_id = normalize_channel_ref(channel_id)
+    if normalized_id in configured:
+        return True
+    if channel_id.upper().startswith(("C", "G")) and all(c.upper().startswith(("C", "G")) for c in configured):
+        return False
+    channel_name = get_channel_name(config, client, channel_id)
+    return bool(channel_name and channel_name in configured)
+
+
+def format_slack_timestamp(ts: str | None) -> str:
+    if not ts:
+        return "unknown time"
+    try:
+        timestamp = float(ts)
+    except ValueError:
+        return "unknown time"
+    return datetime.fromtimestamp(timestamp).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
 def slack_messages_to_lines(config: AgentConfig, client, messages: list[dict[str, Any]]) -> list[str]:
     lines = []
     for msg in messages:
@@ -547,7 +854,7 @@ def slack_messages_to_lines(config: AgentConfig, client, messages: list[dict[str
             speaker = msg.get("username") or "bot"
         else:
             speaker = "unknown"
-        lines.append(f"{speaker}: {text}")
+        lines.append(f"[{format_slack_timestamp(msg.get('ts'))}] {speaker}: {text}")
     return lines
 
 
@@ -675,6 +982,314 @@ def handle_memory_commands(config: AgentConfig, text: str, memory: dict[str, Any
     )
 
 
+def tool_get_time(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    timezone = str(args.get("timezone") or os.getenv("TZ") or "America/New_York")
+    try:
+        current = datetime.now(ZoneInfo(timezone))
+    except ZoneInfoNotFoundError:
+        current = datetime.now().astimezone()
+        timezone = current.tzname() or "local"
+    return {
+        "timezone": timezone,
+        "iso": current.isoformat(timespec="seconds"),
+        "readable": current.strftime("%A, %B %d, %Y at %I:%M %p %Z"),
+    }
+
+
+def tool_search_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    query = str(args.get("query") or ctx.latest_message)
+    limit = max(1, min(int(args.get("limit") or ctx.config.max_memory_lines), 10))
+    memories = [
+        item for item in ctx.memory.get("memories", [])
+        if float(item.get("confidence", 0.7)) >= 0.4
+    ]
+    scored = [
+        (relevance_score(query, memory_item_text(item)), item)
+        for item in memories
+    ]
+    matches = [
+        item for score, item in sorted(scored, key=lambda pair: pair[0], reverse=True)
+        if score > 0
+    ][:limit]
+    return {
+        "query": query,
+        "matches": [
+            {
+                "text": memory_item_text(item),
+                "confidence": float(item.get("confidence", 0.7)),
+                "source": item.get("source", "memory"),
+            }
+            for item in matches
+        ],
+    }
+
+
+def tool_update_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    fact = str(args.get("text") or args.get("fact") or "").strip()
+    if not fact:
+        return {"saved": False, "error": "Missing memory text."}
+
+    confidence = args.get("confidence")
+    if confidence is None:
+        confidence = memory_confidence(fact)
+    confidence = max(0.0, min(float(confidence), 1.0))
+
+    item = make_memory_item(fact, ctx.speaker_name, confidence)
+    memories = ctx.memory.setdefault("memories", [])
+    existing = next((m for m in memories if m.get("id") == item["id"]), None)
+    if existing:
+        existing.update({
+            "text": fact,
+            "updated_at": now(),
+            "confidence": max(float(existing.get("confidence", 0.7)), confidence),
+            "source": ctx.speaker_name,
+        })
+        action = "updated"
+    else:
+        memories.append(item)
+        action = "created"
+
+    prune_memory(ctx.config, ctx.memory)
+    save_memory(ctx.config, ctx.memory)
+    return {"saved": True, "action": action, "text": fact, "confidence": confidence}
+
+
+def tool_summarize_thread(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    lines = ctx.thread_context_lines[-ctx.config.thread_fetch_limit:]
+    if not lines:
+        return {"summary": "No thread context available."}
+    focus = str(args.get("focus") or ctx.latest_message)
+    prompt = f"""
+Summarize this Slack thread in 3 short bullets. Focus on: {focus}
+
+Thread:
+{chr(10).join(lines)}
+""".strip()
+    return {"summary": call_ollama(ctx.config, prompt)}
+
+
+def tool_get_channel_context(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    limit = max(1, min(int(args.get("limit") or ctx.config.max_channel_lines), 20))
+    lines = ctx.channel_context_lines
+    if not lines:
+        lines = fetch_channel_context(ctx.config, ctx.client, ctx.channel, ctx.latest_ts)
+    lines = lines[-limit:]
+    return {
+        "lines": lines,
+        "note": "Most recent channel messages before the latest message.",
+    }
+
+
+def tool_get_user_profile(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    raw_user = str(args.get("user") or args.get("name") or "").strip()
+    target = clean_slack_text(raw_user)
+    if not target:
+        return {"found": False, "error": "Missing user."}
+
+    user_id_match = re.search(r"@?(U[A-Z0-9]+)", target, flags=re.I)
+    if user_id_match:
+        user_id = user_id_match.group(1).upper()
+        try:
+            result = ctx.client.users_info(user=user_id)
+            user = result.get("user", {})
+        except Exception as e:
+            return {"found": False, "error": str(e)}
+        profile = user.get("profile", {})
+        return {
+            "found": True,
+            "id": user.get("id"),
+            "name": profile.get("display_name") or profile.get("real_name") or user.get("name"),
+            "real_name": profile.get("real_name"),
+            "title": profile.get("title"),
+            "tz": user.get("tz"),
+            "is_bot": bool(user.get("is_bot")),
+        }
+
+    query = normalize_phrase(target).lstrip("@")
+    try:
+        result = ctx.client.users_list(limit=200)
+    except Exception as e:
+        return {"found": False, "error": str(e)}
+
+    matches = []
+    for user in result.get("members", []):
+        profile = user.get("profile", {})
+        names = [
+            user.get("name", ""),
+            profile.get("display_name", ""),
+            profile.get("real_name", ""),
+        ]
+        if any(query and query in normalize_phrase(name) for name in names):
+            matches.append({
+                "id": user.get("id"),
+                "name": profile.get("display_name") or profile.get("real_name") or user.get("name"),
+                "real_name": profile.get("real_name"),
+                "title": profile.get("title"),
+                "tz": user.get("tz"),
+                "is_bot": bool(user.get("is_bot")),
+            })
+    return {"found": bool(matches), "matches": matches[:5]}
+
+
+def tool_list_recent_threads(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    limit = max(1, min(int(args.get("limit") or 8), 20))
+    history_limit = max(limit * 4, 30)
+    try:
+        result = ctx.client.conversations_history(
+            channel=ctx.channel,
+            latest=ctx.latest_ts,
+            limit=history_limit,
+            inclusive=False,
+        )
+    except Exception as e:
+        return {"threads": [], "error": str(e)}
+
+    threads = OrderedDict()
+    for msg in result.get("messages", []):
+        root_ts = msg.get("thread_ts") or msg.get("ts")
+        if not root_ts or root_ts in threads:
+            continue
+        reply_count = int(msg.get("reply_count", 0) or 0)
+        if reply_count <= 0 and msg.get("thread_ts") is None:
+            continue
+        speaker = get_event_speaker_name(ctx.config, ctx.client, msg)
+        threads[root_ts] = {
+            "thread_ts": root_ts,
+            "time": format_slack_timestamp(root_ts),
+            "speaker": speaker,
+            "reply_count": reply_count,
+            "text": clean_slack_text(msg.get("text", ""))[:240],
+        }
+        if len(threads) >= limit:
+            break
+    return {"threads": list(threads.values())}
+
+
+def tool_save_thread_summary(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    summary = str(args.get("summary") or "").strip()
+    if not summary:
+        if not ctx.thread_context_lines:
+            return {"saved": False, "error": "No thread context available."}
+        prompt = f"""
+Summarize this Slack thread as one durable memory sentence. Include the date if useful.
+
+Thread:
+{chr(10).join(ctx.thread_context_lines)}
+""".strip()
+        summary = call_ollama(ctx.config, prompt)
+
+    text = f"Thread summary from {format_slack_timestamp(ctx.thread_ts)}: {summary}"
+    item = make_memory_item(text, "thread_summary", float(args.get("confidence") or 0.8))
+    memories = ctx.memory.setdefault("memories", [])
+    existing = next((m for m in memories if m.get("id") == item["id"]), None)
+    if existing:
+        existing.update({"text": text, "updated_at": now(), "confidence": max(float(existing.get("confidence", 0.7)), item["confidence"])})
+        action = "updated"
+    else:
+        memories.append(item)
+        action = "created"
+    prune_memory(ctx.config, ctx.memory)
+    save_memory(ctx.config, ctx.memory)
+    return {"saved": True, "action": action, "text": text}
+
+
+def tool_search_channel_history(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    query = str(args.get("query") or "").strip()
+    if not query:
+        return {"matches": [], "error": "Missing query."}
+    limit = max(1, min(int(args.get("limit") or 8), 20))
+    history_limit = max(limit * 8, 50)
+    try:
+        result = ctx.client.conversations_history(
+            channel=ctx.channel,
+            latest=ctx.latest_ts,
+            limit=history_limit,
+            inclusive=False,
+        )
+    except Exception as e:
+        return {"matches": [], "error": str(e)}
+
+    messages = slack_messages_to_lines(ctx.config, ctx.client, list(reversed(result.get("messages", []))))
+    scored = [
+        (relevance_score(query, line), line)
+        for line in messages
+    ]
+    matches = [
+        line for score, line in sorted(scored, key=lambda item: item[0], reverse=True)
+        if score > 0
+    ][:limit]
+    return {"query": query, "matches": matches}
+
+
+def tool_set_reminder_note(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    text = str(args.get("text") or args.get("note") or "").strip()
+    due = str(args.get("due") or args.get("when") or "").strip()
+    if not text:
+        return {"saved": False, "error": "Missing reminder text."}
+    reminder_text = f"Reminder note"
+    if due:
+        reminder_text += f" for {due}"
+    reminder_text += f": {text}"
+    item = make_memory_item(reminder_text, "reminder_note", float(args.get("confidence") or 0.75))
+    item["kind"] = "reminder_note"
+    if due:
+        item["due"] = due
+    ctx.memory.setdefault("memories", []).append(item)
+    prune_memory(ctx.config, ctx.memory)
+    save_memory(ctx.config, ctx.memory)
+    return {"saved": True, "text": reminder_text}
+
+
+def tool_react_to_message(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    emoji = str(args.get("emoji") or "").strip().strip(":")
+    if not emoji:
+        return {"reacted": False, "error": "Missing emoji."}
+    target_ts = str(args.get("ts") or ctx.latest_ts)
+    try:
+        result = ctx.client.reactions_get(channel=ctx.channel, timestamp=target_ts, full=False)
+        message = result.get("message", {})
+        for reaction in message.get("reactions", []):
+            if reaction.get("name") == emoji:
+                return {"reacted": False, "emoji": emoji, "reason": "already_present", "ts": target_ts, "reply_text": ""}
+    except Exception as e:
+        debug(ctx.config, f"Could not inspect existing reactions: {e}")
+    try:
+        ctx.client.reactions_add(channel=ctx.channel, timestamp=target_ts, name=emoji)
+    except Exception as e:
+        return {"reacted": False, "emoji": emoji, "error": str(e), "reply_text": f"I tried to react with :{emoji}:, but Slack rejected it."}
+    return {"reacted": True, "emoji": emoji, "ts": target_ts, "reply_text": ""}
+
+
+TOOL_HANDLERS = {
+    "get_time": tool_get_time,
+    "search_memory": tool_search_memory,
+    "update_memory": tool_update_memory,
+    "summarize_thread": tool_summarize_thread,
+    "get_channel_context": tool_get_channel_context,
+    "get_user_profile": tool_get_user_profile,
+    "list_recent_threads": tool_list_recent_threads,
+    "save_thread_summary": tool_save_thread_summary,
+    "search_channel_history": tool_search_channel_history,
+    "set_reminder_note": tool_set_reminder_note,
+    "react_to_message": tool_react_to_message,
+}
+
+
+TOOL_DESCRIPTIONS = {
+    "get_time": "Get the current date/time for time, date, elapsed-time, or relative-time questions. Arguments: timezone, optional IANA timezone.",
+    "search_memory": "Search this agent's memory. Arguments: query, optional limit.",
+    "update_memory": "Save one durable memory claim. Arguments: text or fact, optional confidence 0-1.",
+    "summarize_thread": "Summarize the current Slack thread. Arguments: optional focus.",
+    "get_channel_context": "Inspect recent channel messages before this event. Arguments: optional limit.",
+    "get_user_profile": "Look up a Slack user's basic profile. Arguments: user/name.",
+    "list_recent_threads": "List recently active threads in the current channel. Arguments: optional limit.",
+    "save_thread_summary": "Save a durable memory summary of the current thread. Arguments: optional summary/confidence.",
+    "search_channel_history": "Search recent messages in the current channel. Arguments: query, optional limit.",
+    "set_reminder_note": "Save a local reminder note with optional due text. Arguments: text/note, optional due/when.",
+    "react_to_message": "Add a natural emoji reaction to the current or specified message. Arguments: emoji, optional ts.",
+}
+
+
 def selected_memory_lines(config: AgentConfig, latest_message: str, memory: dict[str, Any]) -> list[str]:
     memories = [
         item for item in memory.get("memories", [])
@@ -684,7 +1299,7 @@ def selected_memory_lines(config: AgentConfig, latest_message: str, memory: dict
         latest_message,
         [memory_item_text(item) for item in memories],
         config.max_memory_lines,
-        always_keep_last=2,
+        always_keep_last=0,
     )
     selected = []
     for text in by_relevance:
@@ -696,17 +1311,23 @@ def selected_memory_lines(config: AgentConfig, latest_message: str, memory: dict
     return selected
 
 
-def call_ollama(config: AgentConfig, prompt: str) -> str:
+def call_ollama(
+    config: AgentConfig,
+    prompt: str,
+    model: str | None = None,
+    num_predict: int | None = None,
+    temperature: float | None = None,
+) -> str:
     try:
         response = requests.post(
             "http://localhost:11434/api/generate",
             json={
-                "model": config.ollama_model,
+                "model": model or config.ollama_model,
                 "prompt": prompt,
                 "stream": False,
                 "options": {
-                    "num_predict": config.ollama_num_predict,
-                    "temperature": config.ollama_temperature,
+                    "num_predict": num_predict or config.ollama_num_predict,
+                    "temperature": config.ollama_temperature if temperature is None else temperature,
                     "num_ctx": config.ollama_num_ctx,
                 },
             },
@@ -722,6 +1343,62 @@ def call_ollama(config: AgentConfig, prompt: str) -> str:
         return f"Ollama returned an error: {e}"
 
 
+def extract_json_object(text: str) -> dict[str, Any] | None:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        objects = []
+        for match in re.finditer(r"\{", cleaned):
+            try:
+                candidate, _ = decoder.raw_decode(cleaned[match.start():])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                objects.append(candidate)
+        if not objects:
+            return None
+        tool_calls = [obj for obj in objects if obj.get("type") == "tool_call"]
+        return tool_calls[-1] if tool_calls else objects[-1]
+    return data if isinstance(data, dict) else None
+
+
+def enabled_tool_descriptions(config: AgentConfig) -> str:
+    lines = []
+    for name in config.enabled_tools:
+        description = TOOL_DESCRIPTIONS.get(name)
+        if description:
+            lines.append(f"- {name}: {description}")
+    return "\n".join(lines) if lines else "No tools enabled."
+
+
+def tool_instruction_text(config: AgentConfig) -> str:
+    if not config.enabled_tools:
+        return ""
+    return f"""
+
+Available tools:
+{enabled_tool_descriptions(config)}
+
+Use tools based on intent, not exact wording:
+- Use get_time for current time/date, deadlines, elapsed time, "how long ago", "when was that", or relative time questions.
+- Use search_memory when the user asks what you know/remember about a specific person, topic, preference, or past fact.
+- Use update_memory when the user asks you to remember something or clearly states a durable fact you should keep.
+- Use summarize_thread when the user asks for a recap, summary, decision, or what happened in this thread.
+- Use get_channel_context when the user asks what they missed, what happened recently, or needs recent channel context.
+
+If a tool would clearly help, respond with only JSON:
+{{"type":"tool_call","tool":"tool_name","arguments":{{}}}}
+
+If no tool is needed, respond with only JSON:
+{{"type":"reply","text":"your Slack reply"}}
+""".rstrip()
+
+
 def build_prompt(
     config: AgentConfig,
     latest_message: str,
@@ -729,6 +1406,7 @@ def build_prompt(
     memory: dict[str, Any],
     thread_context_lines: list[str],
     channel_context_lines: list[str],
+    tool_mode: bool = True,
 ) -> str:
     personality = config.personality_path.read_text(encoding="utf-8").strip()
     cleaned_latest = clean_slack_text(latest_message)
@@ -769,13 +1447,230 @@ Latest message:
 Instructions:
 - Reply to the latest message only.
 - Keep the response brief and Slack-like unless directly asked for detail.
+- Act like a real participant in the chat, not a support assistant.
+- If the latest message only mentions you in passing, keep the reply especially short or acknowledge lightly.
 - Treat memory as fallible claims, not guaranteed truth.
 - Trust the current Slack context over memory if they conflict.
+- Do not mention memory or remembered facts unless directly relevant or asked.
 - Do not invent events, relationships, or claims not supported by the context or memory.
 - Do not continue a bot-to-bot riff unless a human clearly asked you to.
 - Do not summarize all context unless asked.
 - Avoid using people's full names.
+{tool_instruction_text(config) if tool_mode else ""}
 """.strip()
+
+
+def build_tool_result_prompt(
+    config: AgentConfig,
+    latest_message: str,
+    speaker_name: str,
+    memory: dict[str, Any],
+    tool_name: str,
+    tool_result: dict[str, Any],
+    thread_context_lines: list[str],
+    channel_context_lines: list[str],
+    explicit: bool = True,
+) -> str:
+    base = build_prompt(
+        config=config,
+        latest_message=latest_message,
+        speaker_name=speaker_name,
+        memory=memory,
+        thread_context_lines=thread_context_lines,
+        channel_context_lines=channel_context_lines,
+        tool_mode=False,
+    )
+    return f"""
+{base}
+
+Tool used: {tool_name}
+Tool result:
+{json.dumps(tool_result, ensure_ascii=False, indent=2)}
+
+Write the final Slack reply using the tool result as the source of truth.
+- Do not contradict the tool result.
+- If the tool result has matches, threads, lines, or profile fields, use those concrete details.
+- If the tool result is empty, say that directly and briefly.
+- Do not pretend you checked something beyond the tool result.
+- Do not mention JSON or tools unless the user asked.
+- {"Keep it especially short because this was not an explicit request." if not explicit else "Answer the user's request directly."}
+""".strip()
+
+
+def direct_tool_reply(tool_name: str, tool_result: dict[str, Any], explicit: bool) -> str | None:
+    if tool_name == "list_recent_threads":
+        threads = tool_result.get("threads") or []
+        if not threads:
+            return "I don't see any active threads recently."
+        lines = [
+            f"- {thread.get('time')}: {thread.get('speaker')} - {thread.get('text')} ({thread.get('reply_count')} replies)"
+            for thread in threads[:8]
+        ]
+        return "Recent active threads:\n" + "\n".join(lines)
+
+    if tool_name == "search_channel_history":
+        matches = tool_result.get("matches") or []
+        query = tool_result.get("query") or "that"
+        if not matches:
+            return f"I didn't find recent channel mentions of {query}."
+        lines = [f"- {match}" for match in matches[:5]]
+        return "I found these recent mentions:\n" + "\n".join(lines)
+
+    if tool_name == "get_channel_context":
+        lines = tool_result.get("lines") or []
+        if not lines:
+            return "I don't see much recent channel context."
+        return "Recent channel context:\n" + "\n".join(f"- {line}" for line in lines[-6:])
+
+    return None
+
+
+def run_tool_call(tool_call: dict[str, Any], ctx: ToolContext) -> tuple[str, dict[str, Any]] | None:
+    tool_name = str(tool_call.get("tool") or "")
+    if tool_name not in ctx.config.enabled_tools:
+        event_log(ctx.config, "tool_rejected", tool=tool_name, reason="not_enabled", raw=tool_call)
+        return None
+    handler = TOOL_HANDLERS.get(tool_name)
+    if not handler:
+        event_log(ctx.config, "tool_rejected", tool=tool_name, reason="missing_handler", raw=tool_call)
+        return None
+    arguments = tool_call.get("arguments") or {}
+    if not isinstance(arguments, dict):
+        arguments = {}
+    debug(ctx.config, f"Running tool {tool_name} with args={arguments!r}")
+    result = handler(arguments, ctx)
+    event_log(ctx.config, "tool_result", tool=tool_name, arguments=arguments, result=result)
+    return tool_name, result
+
+
+def make_tool_call(tool: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {"type": "tool_call", "tool": tool, "arguments": arguments or {}}
+
+
+def likely_reaction_emoji(text: str) -> str:
+    cleaned = normalize_phrase(text)
+    if any(p in cleaned for p in ["thank you", "thanks", "ty", "pray"]):
+        return "pray"
+    if any(p in cleaned for p in ["congrats", "congratulations", "shipped", "huge win", "big win", "lets go", "lfg"]):
+        return "tada"
+    if any(p in cleaned for p in ["worked", "great job", "good job", "nailed it"]):
+        return "raised_hands"
+    if any(p in cleaned for p in ["lol", "lmao"]):
+        return "joy"
+    if "rip" in cleaned:
+        return "pray"
+    return "thumbsup"
+
+
+def deterministic_tool_route(ctx: ToolContext) -> dict[str, Any] | None:
+    cleaned = normalize_phrase(ctx.latest_message)
+    text = clean_slack_text(ctx.latest_message)
+
+    if re.search(r"\b(when|how long ago)\b.*\b(last\s+)?mention", cleaned):
+        user_match = re.search(r"@?U[A-Z0-9]+", text, flags=re.I)
+        if user_match:
+            return make_tool_call("search_channel_history", {"query": user_match.group(0), "limit": 8})
+        query = re.sub(r"\b(wee|irdnennam|when|how long ago|did|i|last|mention|mentioned)\b", " ", cleaned)
+        query = re.sub(r"\s+", " ", query).strip(" ?.,")
+        return make_tool_call("search_channel_history", {"query": query or cleaned, "limit": 8})
+
+    if re.search(r"\b(who is|who's|timezone|time zone|profile|title)\b", cleaned) and re.search(r"@?U[A-Z0-9]+", text, flags=re.I):
+        user = re.search(r"@?U[A-Z0-9]+", text, flags=re.I).group(0)
+        return make_tool_call("get_user_profile", {"user": user})
+
+    if any(p in cleaned for p in ["what did i miss", "what'd i miss", "catch me up", "what happened recently"]):
+        return make_tool_call("get_channel_context", {"limit": 10})
+
+    if re.search(r"\b(did we|have we|anyone)\b.*\b(talk|mention|discuss)\b", cleaned):
+        query = re.sub(r"\b(wee|irdnennam|did we|have we|anyone|talk about|talked about|mention|mentioned|discuss|discussed|recently)\b", " ", cleaned)
+        query = re.sub(r"\s+", " ", query).strip(" ?.,")
+        return make_tool_call("search_channel_history", {"query": query or cleaned, "limit": 8})
+
+    if any(p in cleaned for p in ["what threads are active", "active threads", "recent threads", "what are people talking about"]):
+        return make_tool_call("list_recent_threads", {"limit": 8})
+
+    if text_is_reaction_worthy(ctx.latest_message):
+        return make_tool_call("react_to_message", {"emoji": likely_reaction_emoji(ctx.latest_message)})
+
+    return None
+
+
+def build_tool_router_prompt(ctx: ToolContext) -> str:
+    thread_text = "\n".join(ctx.thread_context_lines[-ctx.config.max_thread_lines:]) or "No thread context."
+    channel_text = "\n".join(ctx.channel_context_lines[-ctx.config.max_channel_lines:]) or "No channel context."
+    return f"""
+You are a routing model for a Slack chat agent. Decide if the latest message needs a tool.
+
+Available tools:
+{enabled_tool_descriptions(ctx.config)}
+
+Use tools based on intent, not exact wording:
+- get_time: current time/date, deadlines, elapsed time, "how long ago", "when was that", relative time.
+- search_memory: questions about remembered facts, preferences, people, or past claims.
+- update_memory: requests to remember something or clear durable facts worth storing.
+- summarize_thread: recap, summarize, decisions, action items, or what happened in this thread.
+- get_channel_context: what did I miss, what happened recently, recent channel context.
+- get_user_profile: who is this person, what is their Slack profile/title/timezone, or resolving a user mention.
+- list_recent_threads: what threads are active, what are people talking about, recent discussions.
+- save_thread_summary: remember/save the decision or outcome from this thread.
+- search_channel_history: did we talk about a topic recently, find recent mentions in this channel.
+- set_reminder_note: remember to do something later, remind me/us, keep a dated note.
+- react_to_message: user asks you to react, or a lightweight emoji reaction is more natural than text. Use for celebrations, wins, thanks, jokes, agreement, sympathy, or acknowledgements. Pick common Slack emoji names like tada, raised_hands, clap, heart, joy, fire, eyes, white_check_mark, thumbsup, or pray. Do not react to every positive message.
+
+Recent channel context:
+{channel_text}
+
+Thread context:
+{thread_text}
+
+Latest message:
+{ctx.speaker_name}: {clean_slack_text(ctx.latest_message)}
+
+Return only JSON. Use one of:
+{{"type":"none"}}
+{{"type":"tool_call","tool":"get_time","arguments":{{"timezone":"America/New_York"}}}}
+{{"type":"tool_call","tool":"search_memory","arguments":{{"query":"topic","limit":5}}}}
+{{"type":"tool_call","tool":"update_memory","arguments":{{"text":"fact","confidence":0.7}}}}
+{{"type":"tool_call","tool":"summarize_thread","arguments":{{"focus":"what to summarize"}}}}
+{{"type":"tool_call","tool":"get_channel_context","arguments":{{"limit":10}}}}
+{{"type":"tool_call","tool":"get_user_profile","arguments":{{"user":"name or user id"}}}}
+{{"type":"tool_call","tool":"list_recent_threads","arguments":{{"limit":8}}}}
+{{"type":"tool_call","tool":"save_thread_summary","arguments":{{"summary":"decision or outcome"}}}}
+{{"type":"tool_call","tool":"search_channel_history","arguments":{{"query":"topic","limit":8}}}}
+{{"type":"tool_call","tool":"set_reminder_note","arguments":{{"text":"thing to remember","due":"when"}}}}
+{{"type":"tool_call","tool":"react_to_message","arguments":{{"emoji":"thumbsup"}}}}
+
+Do not include explanations. Do not include multiple JSON objects.
+Prefer a tool call for profile, "what did I miss", channel-history, active-thread, reminder, time, and recap requests even if recent context seems partially useful.
+Choose none only for greetings, opinions, casual replies, or when no listed tool would materially improve the answer. Prefer react_to_message over a text reply when a small social acknowledgement is enough.
+""".strip()
+
+
+def route_tool_call(ctx: ToolContext) -> dict[str, Any] | None:
+    if not ctx.config.enabled_tools:
+        event_log(ctx.config, "tool_router", decision="none", reason="no_enabled_tools")
+        return None
+    deterministic = deterministic_tool_route(ctx)
+    if deterministic and deterministic.get("tool") in ctx.config.enabled_tools:
+        event_log(ctx.config, "tool_router", decision="tool_call", route="deterministic", tool=deterministic["tool"], parsed=deterministic)
+        return deterministic
+    raw = call_ollama(
+        ctx.config,
+        build_tool_router_prompt(ctx),
+        model=ctx.config.tool_router_model,
+        num_predict=180,
+        temperature=0.0,
+    )
+    parsed = extract_json_object(raw)
+    if not parsed or parsed.get("type") != "tool_call":
+        event_log(ctx.config, "tool_router", decision="none", raw=raw[:1000], parsed=parsed)
+        return None
+    tool_name = str(parsed.get("tool") or "")
+    if tool_name not in ctx.config.enabled_tools:
+        event_log(ctx.config, "tool_router", decision="rejected", reason="not_enabled", raw=raw[:1000], parsed=parsed)
+        return None
+    event_log(ctx.config, "tool_router", decision="tool_call", route="model", tool=tool_name, parsed=parsed)
+    return parsed
 
 
 def generate_reply(
@@ -785,7 +1680,53 @@ def generate_reply(
     memory: dict[str, Any],
     thread_context_lines: list[str],
     channel_context_lines: list[str],
+    client: Any,
+    channel: str,
+    thread_ts: str,
+    latest_ts: str,
+    explicit: bool,
 ) -> str:
+    tool_context = ToolContext(
+        config=config,
+        client=client,
+        memory=memory,
+        channel=channel,
+        thread_ts=thread_ts,
+        latest_ts=latest_ts,
+        latest_message=latest_message,
+        speaker_name=speaker_name,
+        thread_context_lines=thread_context_lines,
+        channel_context_lines=channel_context_lines,
+    )
+    routed_tool_call = route_tool_call(tool_context)
+    tool_run = run_tool_call(routed_tool_call, tool_context) if routed_tool_call else None
+
+    if tool_run:
+        tool_name, tool_result = tool_run
+        if tool_name == "react_to_message" and not explicit:
+            save_memory(config, memory)
+            return str(tool_result.get("reply_text") or "").strip()
+        direct_reply = direct_tool_reply(tool_name, tool_result, explicit)
+        if direct_reply:
+            save_memory(config, memory)
+            return direct_reply
+        reply = call_ollama(
+            config,
+            build_tool_result_prompt(
+                config=config,
+                latest_message=latest_message,
+                speaker_name=speaker_name,
+                memory=memory,
+                tool_name=tool_name,
+                tool_result=tool_result,
+                thread_context_lines=thread_context_lines,
+                channel_context_lines=channel_context_lines,
+                explicit=explicit,
+            ),
+        )
+        save_memory(config, memory)
+        return reply
+
     prompt = build_prompt(
         config=config,
         latest_message=latest_message,
@@ -793,14 +1734,32 @@ def generate_reply(
         memory=memory,
         thread_context_lines=thread_context_lines,
         channel_context_lines=channel_context_lines,
+        tool_mode=False,
     )
     reply = call_ollama(config, prompt)
     save_memory(config, memory)
     return reply
 
 
-def should_respond_to_channel_message(config: AgentConfig, text: str) -> bool:
-    return text_mentions_agent(config, text) or text_asks_agent_question(config, text)
+def should_respond_to_channel_message(
+    config: AgentConfig,
+    text: str,
+    ambient_allowed: bool = True,
+    is_bot_message: bool = False,
+) -> ResponseDecision:
+    if text_directly_addresses_agent(config, text) or text_asks_agent_question(config, text):
+        return ResponseDecision(True, True, "direct")
+    if text_is_passive_agent_mention(config, text):
+        return ResponseDecision(False, False, "passive_name_mention")
+    if is_bot_message:
+        return ResponseDecision(False, False, "bot_ambient_suppressed")
+    if not ambient_allowed:
+        return ResponseDecision(False, False, "explicit_only_channel")
+    if text_is_reaction_worthy(text):
+        return ResponseDecision(True, False, "reaction_worthy")
+    if text_invites_room_response(text) and deterministic_chance(text, config.ambient_response_chance):
+        return ResponseDecision(True, False, "ambient_room_prompt")
+    return ResponseDecision(False, False, "not_relevant")
 
 
 def should_respond_to_thread_reply(
@@ -808,23 +1767,32 @@ def should_respond_to_thread_reply(
     text: str,
     thread_state: dict[str, Any] | None,
     is_bot_message: bool,
-) -> tuple[bool, bool]:
-    explicit = text_mentions_agent(config, text) or text_asks_agent_question(config, text)
+    ambient_allowed: bool = True,
+) -> ResponseDecision:
+    explicit = text_directly_addresses_agent(config, text) or text_asks_agent_question(config, text)
     if explicit:
-        return True, True
+        return ResponseDecision(True, True, "direct")
     if not thread_state:
-        return False, False
+        return ResponseDecision(False, False, "inactive_thread")
     if is_bot_message:
-        return False, False
+        return ResponseDecision(False, False, "bot_message")
     if int(thread_state.get("auto_reply_count", 0)) >= config.max_auto_replies_per_thread:
-        return False, False
-    if now() - int(thread_state.get("last_bot_reply_at", 0)) < config.response_cooldown_seconds:
-        return False, False
-    if text_is_about_agent(config, text, active_thread=True):
-        return True, False
-    if "?" in text and text_asks_active_followup(text):
-        return True, False
-    return False, False
+        return ResponseDecision(False, False, "thread_auto_reply_limit")
+    if text_mentions_agent(config, text) and text_is_social_ack(text):
+        return ResponseDecision(True, False, "social_ack")
+    if text_is_passive_agent_mention(config, text):
+        return ResponseDecision(False, False, "passive_name_mention")
+    if not ambient_allowed:
+        return ResponseDecision(False, False, "explicit_only_channel")
+    if text_is_reaction_worthy(text):
+        return ResponseDecision(True, False, "reaction_worthy")
+    if text_asks_active_followup(text):
+        return ResponseDecision(True, False, "active_followup")
+    if text_invites_room_response(text) and deterministic_chance(text, config.thread_ambient_response_chance):
+        return ResponseDecision(True, False, "ambient_thread_prompt")
+    if text_is_about_agent(config, text, active_thread=True) and deterministic_chance(text, config.thread_ambient_response_chance / 2):
+        return ResponseDecision(True, False, "ambient_about_agent")
+    return ResponseDecision(False, False, "not_relevant")
 
 
 def respond_as_agent(
@@ -841,12 +1809,13 @@ def respond_as_agent(
 ) -> None:
     start = time.time()
     text = event.get("text", "")
-    speaker_name = get_user_name(config, client, event.get("user"))
+    speaker_name = get_event_speaker_name(config, client, event)
 
     command_reply = handle_memory_commands(config, text, memory, speaker_name)
     if command_reply:
         say(text=command_reply, thread_ts=thread_ts)
         record_bot_reply(config, memory, channel, thread_ts, explicit=True)
+        event_log(config, "memory_command_reply", channel=channel, thread_ts=thread_ts, text=text, reply=command_reply)
         debug(config, f"Memory command replied in {time.time() - start:.2f}s")
         return
 
@@ -864,9 +1833,41 @@ def respond_as_agent(
         memory=memory,
         thread_context_lines=thread_context_lines,
         channel_context_lines=channel_context_lines,
+        client=client,
+        channel=channel,
+        thread_ts=thread_ts,
+        latest_ts=event["ts"],
+        explicit=explicit,
     )
+    if not reply:
+        record_bot_reply(config, memory, channel, thread_ts, explicit=explicit)
+        event_log(
+            config,
+            "reply_skipped",
+            channel=channel,
+            thread_ts=thread_ts,
+            latest_ts=event.get("ts"),
+            explicit=explicit,
+            elapsed_seconds=round(time.time() - start, 2),
+            text=text,
+            reason="empty_reply_after_tool",
+        )
+        debug(config, f"Slack reply skipped in {time.time() - start:.2f}s")
+        return
+
     say(text=reply, thread_ts=thread_ts)
     record_bot_reply(config, memory, channel, thread_ts, explicit=explicit)
+    event_log(
+        config,
+        "reply_sent",
+        channel=channel,
+        thread_ts=thread_ts,
+        latest_ts=event.get("ts"),
+        explicit=explicit,
+        elapsed_seconds=round(time.time() - start, 2),
+        text=text,
+        reply=reply,
+    )
     debug(config, f"Slack reply sent in {time.time() - start:.2f}s")
 
 
@@ -876,7 +1877,9 @@ def create_app(config: AgentConfig) -> App:
     @app.event("app_mention")
     def handle_explicit_mention(event, say, client):
         debug_event(config, "APP_MENTION", event)
+        event_log_message(config, "app_mention_received", event)
         if should_ignore_event(config, event):
+            event_log(config, "ignored", source="app_mention", reason="should_ignore_event", ts=event.get("ts"))
             return
 
         memory = load_memory(config)
@@ -898,7 +1901,9 @@ def create_app(config: AgentConfig) -> App:
     @app.event("message")
     def handle_message(event, say, client):
         debug_event(config, "MESSAGE", event)
+        event_log_message(config, "message_received", event)
         if should_ignore_event(config, event):
+            event_log(config, "ignored", source="message", reason="should_ignore_event", ts=event.get("ts"))
             return
 
         text = event.get("text", "")
@@ -906,10 +1911,30 @@ def create_app(config: AgentConfig) -> App:
         memory = load_memory(config)
         is_thread_reply = "thread_ts" in event
         is_bot_message = bool(event.get("bot_id") or event.get("app_id"))
+        ambient_allowed = not channel_is_explicit_only(config, client, channel)
 
         if not is_thread_reply:
-            if not should_respond_to_channel_message(config, text):
-                debug(config, "Ignoring channel message")
+            decision = should_respond_to_channel_message(
+                config,
+                text,
+                ambient_allowed=ambient_allowed,
+                is_bot_message=is_bot_message,
+            )
+            event_log(
+                config,
+                "response_decision",
+                surface="channel",
+                channel=channel,
+                ts=event.get("ts"),
+                text=text,
+                ambient_allowed=ambient_allowed,
+                is_bot_message=is_bot_message,
+                should_respond=decision.should_respond,
+                explicit=decision.explicit,
+                reason=decision.reason,
+            )
+            if not decision.should_respond:
+                debug(config, f"Ignoring channel message: {decision.reason}")
                 return
             thread_ts = event["ts"]
             mark_thread_active(config, memory, channel, thread_ts)
@@ -922,15 +1947,36 @@ def create_app(config: AgentConfig) -> App:
                 channel=channel,
                 thread_ts=thread_ts,
                 include_channel_context=True,
-                explicit=True,
+                explicit=decision.explicit,
             )
             return
 
         thread_ts = event["thread_ts"]
         thread_state = get_thread_state(config, memory, channel, thread_ts)
-        should_respond, explicit = should_respond_to_thread_reply(config, text, thread_state, is_bot_message)
-        if not should_respond:
-            debug(config, "Ignoring thread reply")
+        decision = should_respond_to_thread_reply(
+            config,
+            text,
+            thread_state,
+            is_bot_message,
+            ambient_allowed=ambient_allowed,
+        )
+        event_log(
+            config,
+            "response_decision",
+            surface="thread",
+            channel=channel,
+            ts=event.get("ts"),
+            thread_ts=thread_ts,
+            text=text,
+            ambient_allowed=ambient_allowed,
+            is_bot_message=is_bot_message,
+            thread_state=thread_state,
+            should_respond=decision.should_respond,
+            explicit=decision.explicit,
+            reason=decision.reason,
+        )
+        if not decision.should_respond:
+            debug(config, f"Ignoring thread reply: {decision.reason}")
             return
 
         mark_thread_active(config, memory, channel, thread_ts)
@@ -943,7 +1989,7 @@ def create_app(config: AgentConfig) -> App:
             channel=channel,
             thread_ts=thread_ts,
             include_channel_context=False,
-            explicit=explicit,
+            explicit=decision.explicit,
         )
 
     return app

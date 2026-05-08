@@ -22,5 +22,23 @@
     "them",
     "their"
   ],
-  "ollama_model": "llama3.1:8b"
+  "explicit_only_channels": [
+    "announcements",
+    "announce"
+  ],
+  "enabled_tools": [
+    "get_time",
+    "search_memory",
+    "update_memory",
+    "summarize_thread",
+    "get_channel_context",
+    "get_user_profile",
+    "list_recent_threads",
+    "save_thread_summary",
+    "search_channel_history",
+    "set_reminder_note",
+    "react_to_message"
+  ],
+  "ollama_model": "llama3.1:8b",
+  "tool_router_model": "llama3.1:8b"
 }

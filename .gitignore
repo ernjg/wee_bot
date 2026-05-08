@@ -12,3 +12,4 @@ agents/*
 !agents/example/**
 /irdnennam/
 /logs/
+log.txt
