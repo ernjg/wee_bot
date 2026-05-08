@@ -247,16 +247,3 @@ ollama pull llama3.1:8b
 ollama run llama3.1:8b
 python bot.py --agent wee
 ```
-
-## Git Notes
-
-Do not commit:
-
-```text
-.env
-.venv/
-agents/<real-agent-name>/
-memory.legacy.json
-```
-
-These contain local settings, private tokens, runtime memory, or machine-specific files.
