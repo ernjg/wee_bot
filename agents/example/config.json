@@ -1,0 +1,26 @@
+{
+  "display_name": "Example Agent",
+  "personality_file": "personality.txt",
+  "memory_file": "memory.json",
+  "slack_bot_token_env": "EXAMPLE_SLACK_BOT_TOKEN",
+  "slack_app_token_env": "EXAMPLE_SLACK_APP_TOKEN",
+  "bot_user_id": "U0000000000",
+  "triggers": [
+    "example",
+    "example agent"
+  ],
+  "about_phrases": [
+    "example",
+    "example agent",
+    "you",
+    "your memory",
+    "your response",
+    "are you working"
+  ],
+  "pronoun_about_phrases": [
+    "they",
+    "them",
+    "their"
+  ],
+  "ollama_model": "llama3.1:8b"
+}

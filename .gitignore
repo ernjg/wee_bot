@@ -3,4 +3,12 @@
 __pycache__/
 *.pyc
 memory.json
+memory.legacy.json
 personality.txt
+memory.broken.json
+WEE
+agents/*
+!agents/example/
+!agents/example/**
+/irdnennam/
+/logs/

@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "memories": [
+    {
+      "id": "example001",
+      "text": "This is a safe example memory. Replace it with facts for your real agent.",
+      "confidence": 0.7,
+      "source": "example",
+      "created_at": 0,
+      "updated_at": 0,
+      "last_used": 0,
+      "uses": 0
+    }
+  ],
+  "active_threads": {}
+}
