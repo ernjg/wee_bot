@@ -26,19 +26,48 @@
     "announcements",
     "announce"
   ],
+  "ambient_channel_chances": {
+    "announce": 0.03
+  },
+  "active_thread_ttl_seconds": 14400,
+  "max_active_threads": 25,
   "enabled_tools": [
     "get_time",
     "search_memory",
     "update_memory",
+    "search_relationship_memory",
+    "update_relationship_memory",
     "summarize_thread",
     "get_channel_context",
     "get_user_profile",
     "list_recent_threads",
     "save_thread_summary",
     "search_channel_history",
+    "quote_recent_message",
+    "get_message_permalink",
+    "inspect_reactions",
     "set_reminder_note",
-    "react_to_message"
+    "react_to_message",
+    "add_reaction_set",
+    "read_link_preview",
+    "search_web",
+    "send_voice_note"
   ],
-  "ollama_model": "llama3.1:8b",
-  "tool_router_model": "llama3.1:8b"
+  "voice": {
+    "enabled": false,
+    "provider": "kokoro",
+    "python_exe": ".venv/Scripts/python.exe",
+    "model": "C:/tools/kokoro/kokoro-v1.0.onnx",
+    "voices": "C:/tools/kokoro/voices-v1.0.bin",
+    "voice": "af_sarah",
+    "language": "en-us",
+    "speed": 1.0,
+    "format": "wav",
+    "max_chars": 2400,
+    "response_chance": 0.04
+  },
+  "models": {
+    "reply": "llama3.1:8b",
+    "tool_router": "llama3.1:8b"
+  }
 }

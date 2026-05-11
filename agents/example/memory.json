@@ -2,8 +2,21 @@
   "version": 2,
   "memories": [
     {
-      "id": "example001",
+      "id": "4138898c1d45",
       "text": "This is a safe example memory. Replace it with facts for your real agent.",
+      "confidence": 0.7,
+      "source": "example",
+      "created_at": 0,
+      "updated_at": 0,
+      "last_used": 0,
+      "uses": 0
+    }
+  ],
+  "relationships": [
+    {
+      "id": "b10d83d912fc",
+      "text": "This is a safe example relationship memory. Replace it with lightweight social context for your real agent.",
+      "people": [],
       "confidence": 0.7,
       "source": "example",
       "created_at": 0,
