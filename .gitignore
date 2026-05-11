@@ -10,6 +10,10 @@ WEE
 agents/*
 !agents/example/
 !agents/example/**
+!agents/wee/
+!agents/wee/config.json
+!agents/irdnennam/
+!agents/irdnennam/config.json
 /irdnennam/
 /logs/
 log.txt

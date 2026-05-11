@@ -1,34 +1,46 @@
 {
-  "display_name": "Example Agent",
+  "display_name": "Irdnennam Seravilo",
   "personality_file": "personality.txt",
   "memory_file": "memory.json",
-  "slack_bot_token_env": "EXAMPLE_SLACK_BOT_TOKEN",
-  "slack_app_token_env": "EXAMPLE_SLACK_APP_TOKEN",
-  "bot_user_id": "U0000000000",
+  "slack_bot_token_env": "IRDNENNAM_SLACK_BOT_TOKEN",
+  "slack_app_token_env": "IRDNENNAM_SLACK_APP_TOKEN",
+  "bot_user_id": "U0B3853N9EC",
   "triggers": [
-    "example",
-    "example agent"
+    "irdnennam",
+    "irdnennam seravilo",
+    "irdnennam soravilo",
+    "seravilo",
+    "soravilo",
+    "irdn"
   ],
   "about_phrases": [
-    "example",
-    "example agent",
+    "irdnennam",
+    "irdn",
+    "irdnennam seravilo",
+    "irdnennam soravilo",
+    "seravilo",
+    "soravilo",
     "you",
     "your memory",
+    "your memories",
     "your response",
-    "are you working"
+    "your replies",
+    "your personality",
+    "is he working",
+    "he stopped responding",
+    "why isn't he responding",
+    "why isnt he responding",
+    "irdnennam's memory",
+    "irdnennam's response"
   ],
   "pronoun_about_phrases": [
-    "they",
-    "them",
-    "their"
+    "he",
+    "him",
+    "his"
   ],
   "explicit_only_channels": [
-    "announcements",
     "announce"
   ],
-  "ambient_channel_chances": {
-    "announce": 0.03
-  },
   "active_thread_ttl_seconds": 14400,
   "max_active_threads": 25,
   "enabled_tools": [
@@ -54,21 +66,21 @@
     "send_voice_note"
   ],
   "voice": {
-    "enabled": false,
+    "enabled": true,
     "provider": "f5-tts",
     "python_exe": ".venv/Scripts/python.exe",
     "model": "F5TTS_v1_Base",
-    "voice": "example",
-    "ref_audio": "assets/voices/example/reference.wav",
-    "ref_text": "TODO: exact transcript of the example reference audio.",
+    "voice": "irdnennam",
+    "ref_audio": "assets/voices/irdnennam/reference.wav",
+    "ref_text": "TODO: exact transcript of Irdnennam's reference audio.",
     "language": "en-us",
-    "speed": 1.0,
+    "speed": 0.95,
     "format": "wav",
     "max_chars": 2400,
     "response_chance": 0.04
   },
   "models": {
-    "reply": "llama3.1:8b",
-    "tool_router": "llama3.1:8b"
+    "reply": "qwen2.5:14b",
+    "tool_router": "qwen2.5:14b"
   }
 }

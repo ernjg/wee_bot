@@ -207,7 +207,7 @@ def fake_ollama(config, prompt, model=None, num_predict=None, temperature=None):
         if "link preview" in latest:
             return json.dumps({"type": "tool_call", "intent": "link_preview", "confidence": 0.9, "tool": "read_link_preview", "arguments": {}})
         if "search web" in latest:
-            return json.dumps({"type": "tool_call", "intent": "web_search", "confidence": 0.9, "tool": "search_web", "arguments": {"query": "kokoro tts latest"}})
+            return json.dumps({"type": "tool_call", "intent": "web_search", "confidence": 0.9, "tool": "search_web", "arguments": {"query": "F5-TTS latest"}})
         if "web misroute" in latest:
             return json.dumps({"type": "tool_call", "intent": "web_search", "confidence": 0.9, "tool": "search_web", "arguments": {"query": "unneeded"}})
         if "link misroute" in latest:
@@ -232,8 +232,8 @@ def fake_requests_get(url, **kwargs):
         return FakeResponse(
             """
             <html><body>
-              <a class="result__a" href="https://example.com/kokoro">Kokoro TTS result</a>
-              <a class="result__snippet">Current public info about Kokoro TTS.</a>
+              <a class="result__a" href="https://example.com/f5-tts">F5-TTS result</a>
+              <a class="result__snippet">Current public info about F5-TTS.</a>
             </body></html>
             """,
             url="https://duckduckgo.com/html/",
@@ -293,11 +293,12 @@ def make_config(memory_path: Path, **overrides: Any) -> bot.AgentConfig:
         "ambient_reaction_fallback_chance": 0.0,
         "voice_enabled": False,
         "voice_provider": "fake",
-        "voice_model": "fake-tts",
-        "voice_voices_path": "fake-voices",
+        "voice_model": "F5TTS_v1_Base",
         "voice_python_exe": sys.executable,
         "voice_name": "fake",
         "voice_language": "en-us",
+        "voice_ref_audio": "fake-ref.wav",
+        "voice_ref_text": "This is a fake reference voice.",
         "voice_speed": 1.0,
         "voice_format": "mp3",
         "voice_max_chars": 600,
@@ -481,7 +482,7 @@ DEFAULT_CASES = [
     Case("reaction set", "wee, reaction set for this", expected=Expected("direct", True, 1, 3, 0, False, "normal conversational reply", reaction="tada")),
     Case("link preview", "wee, link preview https://example.com/article", expected=Expected("direct", True, 1, 0, 0, False, "tool-backed reply")),
     Case("link preview misroute rejected", "wee, link misroute without url", expected=Expected("direct", True, 1, 0, 0, False, "normal conversational reply")),
-    Case("web search", "wee, search web for kokoro tts latest", expected=Expected("direct", True, 1, 0, 0, False, "tool-backed reply")),
+    Case("web search", "wee, search web for f5-tts latest", expected=Expected("direct", True, 1, 0, 0, False, "tool-backed reply")),
     Case("web search misroute rejected", "wee, web misroute but just kidding", expected=Expected("direct", True, 1, 0, 0, False, "normal conversational reply")),
     Case("voice note disabled fallback", "wee, send a voice note", expected=Expected("direct", True, 1, 0, 0, False, "Voice notes are disabled")),
     Case("voice note upload", "wee, send a voice note", config_overrides={"voice_enabled": True}, expected=Expected("direct", True, 0, 0, 1, no_initial_comment=True, uploaded_text_contains="normal conversational reply")),

@@ -1,10 +1,9 @@
 certifi==2026.4.22
 charset-normalizer==3.4.7
 idna==3.13
-kokoro-onnx==0.5.0
+f5-tts==1.1.20
 python-dotenv==1.2.2
 requests==2.33.1
 slack_bolt==1.28.0
 slack_sdk==3.41.0
-soundfile==0.13.1
 urllib3==2.6.3

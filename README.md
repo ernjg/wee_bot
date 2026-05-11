@@ -67,13 +67,14 @@ AMBIENT_RESPONSE_CHANCE=0.15
 THREAD_AMBIENT_RESPONSE_CHANCE=0.35
 REACTION_RESPONSE_CHANCE=0.65
 VOICE_ENABLED=0
-TTS_PROVIDER=kokoro
-KOKORO_MODEL_PATH=C:\tools\kokoro\kokoro-v1.0.onnx
-KOKORO_VOICES_PATH=C:\tools\kokoro\voices-v1.0.bin
-KOKORO_PYTHON_EXE=.venv\Scripts\python.exe
-KOKORO_VOICE=af_sarah
-KOKORO_LANGUAGE=en-us
-KOKORO_SPEED=1.0
+TTS_PROVIDER=f5-tts
+F5_TTS_MODEL=F5TTS_v1_Base
+F5_TTS_PYTHON_EXE=.venv\Scripts\python.exe
+F5_TTS_VOICE=example
+F5_TTS_REF_AUDIO=assets\voices\example\reference.wav
+F5_TTS_REF_TEXT=TODO: exact transcript of the reference audio.
+F5_TTS_LANGUAGE=en-us
+F5_TTS_SPEED=1.0
 VOICE_FORMAT=wav
 VOICE_MAX_CHARS=2400
 VOICE_RESPONSE_CHANCE=0.04
@@ -139,11 +140,12 @@ The important config fields are:
   ],
   "voice": {
     "enabled": false,
-    "provider": "kokoro",
+    "provider": "f5-tts",
     "python_exe": ".venv/Scripts/python.exe",
-    "model": "C:/tools/kokoro/kokoro-v1.0.onnx",
-    "voices": "C:/tools/kokoro/voices-v1.0.bin",
-    "voice": "af_sarah",
+    "model": "F5TTS_v1_Base",
+    "voice": "example",
+    "ref_audio": "assets/voices/example/reference.wav",
+    "ref_text": "TODO: exact transcript of the example reference audio.",
     "language": "en-us",
     "speed": 1.0,
     "format": "wav",
@@ -326,7 +328,7 @@ Tool use is intent-based, not tied to exact key phrases. A separate router model
 
 For reactions, add Slack scopes `reactions:write` and `reactions:read`. The bot checks existing reactions when it can, so it avoids adding the same emoji twice.
 
-For voice notes, add Slack scope `files:write` and reinstall the Slack app. Slack does not provide a separate bot API for native human-style voice-note recording; the bot uploads an audio file with `files_upload_v2`, which Slack displays as a playable clip. Voice generation uses local Kokoro TTS when `voice.enabled` is true for the agent. Each agent can use a different Kokoro voice, language, speed, model file, and voices file. Explicit voice-note requests use a spoken-response prompt, so poems, toasts, stories, and explanations can be longer than ordinary chat replies. Otherwise normal text replies become voice notes with `VOICE_RESPONSE_CHANCE`, default `0.04` or 1 in 25. See [docs/KOKORO.md](docs/KOKORO.md) for setup.
+For voice notes, add Slack scope `files:write` and reinstall the Slack app. Slack does not provide a separate bot API for native human-style voice-note recording; the bot uploads an audio file with `files_upload_v2`, which Slack displays as a playable clip. Voice generation uses local F5-TTS when `voice.enabled` is true for the agent. Each agent can use a different custom reference clip and transcript through `ref_audio` and `ref_text`. Explicit voice-note requests use a spoken-response prompt, so poems, toasts, stories, and explanations can be longer than ordinary chat replies. Otherwise normal text replies become voice notes with `VOICE_RESPONSE_CHANCE`, default `0.04` or 1 in 25. See [docs/F5_TTS.md](docs/F5_TTS.md) for setup.
 
 `models.tool_router` defaults to `models.reply` when omitted. You can point it at a smaller/faster Ollama model if tool routing latency becomes annoying. The older top-level `ollama_model` and `tool_router_model` fields still work, but new configs should use the `models` object.
 

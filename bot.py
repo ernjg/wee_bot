@@ -130,10 +130,11 @@ class AgentConfig:
     voice_enabled: bool
     voice_provider: str
     voice_model: str
-    voice_voices_path: str
     voice_python_exe: str
     voice_name: str
     voice_language: str
+    voice_ref_audio: str
+    voice_ref_text: str
     voice_speed: float
     voice_format: str
     voice_max_chars: int
@@ -332,9 +333,9 @@ def load_agent_config(agent_name: str) -> AgentConfig:
         if isinstance(voice_enabled_raw, bool)
         else str(voice_enabled_raw).strip().lower() in {"1", "true", "yes", "on"}
     )
-    voice_name = voice.get("voice") or get_agent_env(agent_name, "KOKORO_VOICE") or "af_sarah"
+    voice_name = voice.get("voice") or get_agent_env(agent_name, "F5_TTS_VOICE") or agent_name
     voice_disclosure = str(voice.get("disclosure") or "")
-    voice_provider = str(voice.get("provider") or get_agent_env(agent_name, "TTS_PROVIDER", "kokoro")).strip().lower()
+    voice_provider = str(voice.get("provider") or get_agent_env(agent_name, "TTS_PROVIDER", "f5-tts")).strip().lower()
     ambient_channel_chances_raw = raw.get("ambient_channel_chances") if isinstance(raw.get("ambient_channel_chances"), dict) else {}
     ambient_channel_chances = {
         normalize_channel_ref(channel): max(0.0, min(float(chance), 1.0))
@@ -394,12 +395,13 @@ def load_agent_config(agent_name: str) -> AgentConfig:
         ),
         voice_enabled=voice_enabled,
         voice_provider=voice_provider,
-        voice_model=str(voice.get("model") or get_agent_env(agent_name, "KOKORO_MODEL_PATH", "C:/tools/kokoro/kokoro-v1.0.onnx")),
-        voice_voices_path=str(voice.get("voices") or get_agent_env(agent_name, "KOKORO_VOICES_PATH", "C:/tools/kokoro/voices-v1.0.bin")),
-        voice_python_exe=str(voice.get("python_exe") or get_agent_env(agent_name, "KOKORO_PYTHON_EXE", sys.executable)),
+        voice_model=str(voice.get("model") or get_agent_env(agent_name, "F5_TTS_MODEL", "F5TTS_v1_Base")),
+        voice_python_exe=str(voice.get("python_exe") or get_agent_env(agent_name, "F5_TTS_PYTHON_EXE", sys.executable)),
         voice_name=str(voice_name),
-        voice_language=str(voice.get("language") or get_agent_env(agent_name, "KOKORO_LANGUAGE", "en-us")),
-        voice_speed=max(0.25, min(float(voice.get("speed") or get_agent_env(agent_name, "KOKORO_SPEED", "1.0")), 4.0)),
+        voice_language=str(voice.get("language") or get_agent_env(agent_name, "F5_TTS_LANGUAGE", "en-us")),
+        voice_ref_audio=str(voice.get("ref_audio") or voice.get("reference_audio") or get_agent_env(agent_name, "F5_TTS_REF_AUDIO", "")),
+        voice_ref_text=str(voice.get("ref_text") or voice.get("reference_text") or get_agent_env(agent_name, "F5_TTS_REF_TEXT", "")),
+        voice_speed=max(0.25, min(float(voice.get("speed") or get_agent_env(agent_name, "F5_TTS_SPEED", "1.0")), 4.0)),
         voice_format=str(voice.get("format") or os.getenv("VOICE_FORMAT") or "wav"),
         voice_max_chars=max(1, int(voice.get("max_chars") or os.getenv("VOICE_MAX_CHARS") or 600)),
         voice_response_chance=max(0.0, min(float(voice.get("response_chance") or os.getenv("VOICE_RESPONSE_CHANCE") or 0.04), 1.0)),
@@ -2153,17 +2155,18 @@ def synthesize_voice_note(config: AgentConfig, text: str) -> Path:
         path.write_bytes(b"fake audio")
         return path
 
-    if config.voice_provider != "kokoro":
+    if config.voice_provider not in {"f5-tts", "f5_tts", "f5"}:
         raise RuntimeError(f"Unsupported TTS provider: {config.voice_provider}")
 
-    model_path = Path(config.voice_model)
-    voices_path = Path(config.voice_voices_path)
-    if not model_path.exists():
-        raise RuntimeError(f"Missing Kokoro model file: {model_path}")
-    if not voices_path.exists():
-        raise RuntimeError(f"Missing Kokoro voices file: {voices_path}")
+    ref_audio = Path(config.voice_ref_audio) if config.voice_ref_audio else None
+    if ref_audio and not ref_audio.is_absolute():
+        ref_audio = repo_root / ref_audio
+    if not ref_audio or not ref_audio.exists():
+        raise RuntimeError(f"Missing F5-TTS reference audio for {config.display_name}: {ref_audio or 'not configured'}")
+    if not config.voice_ref_text.strip():
+        raise RuntimeError(f"Missing F5-TTS reference text for {config.display_name}.")
 
-    helper_path = Path(__file__).resolve().parent / "scripts" / "kokoro_synthesize.py"
+    helper_path = Path(__file__).resolve().parent / "scripts" / "f5_tts_synthesize.py"
     python_exe = Path(config.voice_python_exe)
     if not python_exe.is_absolute():
         python_exe = repo_root / python_exe
@@ -2171,9 +2174,11 @@ def synthesize_voice_note(config: AgentConfig, text: str) -> Path:
         str(python_exe),
         str(helper_path),
         "--model",
-        str(model_path),
-        "--voices",
-        str(voices_path),
+        config.voice_model,
+        "--ref-audio",
+        str(ref_audio),
+        "--ref-text",
+        config.voice_ref_text,
         "--voice",
         config.voice_name,
         "--language",
@@ -2197,9 +2202,9 @@ def synthesize_voice_note(config: AgentConfig, text: str) -> Path:
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout or "").strip()
             event_log(config, "voice_synthesis_failed", provider=config.voice_provider, error=detail[:1000])
-            raise RuntimeError(f"Kokoro TTS failed with exit code {completed.returncode}: {detail[:500]}")
+            raise RuntimeError(f"F5-TTS failed with exit code {completed.returncode}: {detail[:500]}")
         if not path.exists() or path.stat().st_size == 0:
-            raise RuntimeError("Kokoro TTS did not create an audio file.")
+            raise RuntimeError("F5-TTS did not create an audio file.")
         return path
     except Exception:
         if path.exists():
